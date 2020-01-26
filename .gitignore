@@ -1,0 +1,5 @@
+**.exe
+**.dll
+**/kubeconfig
+docs.ps1
+.vscode/**

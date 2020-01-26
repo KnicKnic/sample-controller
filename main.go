@@ -18,31 +18,44 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
-	kubeinformers "k8s.io/client-go/informers"
+	"github.com/scylladb/go-set/strset"
+	"github.com/yyyar/gobetween/config"
+	"github.com/yyyar/gobetween/core"
+	"github.com/yyyar/gobetween/launch"
+	"github.com/yyyar/gobetween/manager"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
 	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
 	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions"
-	"k8s.io/sample-controller/pkg/signals"
 )
 
 var (
-	masterURL  string
-	kubeconfig string
+	masterURL      string
+	kubeconfig     string
+	clusterGroup   string
+	clusterNetwork string
+	clusterName    string
 )
+
+// func NodeIsReady(node v1.a){
+// 	isReady := false
+// 	for _, condition := range node.
+// }
 
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 
-	// set up signals so we handle the first shutdown signal gracefully
-	stopCh := signals.SetupSignalHandler()
+	// // set up signals so we handle the first shutdown signal gracefully
+	// stopCh := signals.SetupSignalHandler()
 
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
@@ -54,29 +67,130 @@ func main() {
 		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
-	exampleClient, err := clientset.NewForConfig(cfg)
-	if err != nil {
-		klog.Fatalf("Error building example clientset: %s", err.Error())
+	// exampleClient, err := clientset.NewForConfig(cfg)
+	// if err != nil {
+	// 	klog.Fatalf("Error building example clientset: %s", err.Error())
+	// }
+
+	// kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
+	// exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
+
+	// controller := NewController(kubeClient, exampleClient,
+	// 	kubeInformerFactory.Apps().V1().Deployments(),
+	// 	exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
+
+	// // notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
+	// // Start method is non-blocking and runs all registered informers in a dedicated goroutine.
+	// kubeInformerFactory.Start(stopCh)
+	// exampleInformerFactory.Start(stopCh)
+
+	// if err = controller.Run(2, stopCh); err != nil {
+	// 	klog.Fatalf("Error running controller: %s", err.Error())
+	// }
+	launch.Launch(config.Config{})
+	delay := time.NewTicker(2 * time.Second)
+	for {
+		set := strset.New()
+
+		nodes, err := kubeClient.CoreV1().Nodes().List(metav1.ListOptions{})
+		if err != nil {
+			panic(err.Error())
+		}
+		//fmt.Printf("There are %d nodes in the cluster %v\n", len(nodes.Items), nodes)
+
+		var node_addresses []string
+		for _, node := range nodes.Items {
+			ready := false
+
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == v1.NodeReady {
+					ready = (condition.Status == "True")
+					break
+				}
+			}
+			if ready {
+				for _, address := range node.Status.Addresses {
+					if address.Type == v1.NodeInternalIP {
+						node_addresses = append(node_addresses, address.Address)
+					}
+				}
+			}
+		}
+
+		// for _, address := range node_addresses {
+		// 	fmt.Println(address)
+		// }
+		// fmt.Println("")
+
+		services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(metav1.ListOptions{TypeMeta: metav1.TypeMeta{Kind: "Service"}})
+		for _, service := range services.Items {
+			if service.Spec.Type == v1.ServiceTypeLoadBalancer {
+				// fmt.Printf("external LBs %v", service)
+
+				vipName := service.Namespace + "%" + service.Name
+				set.Add(vipName)
+				local_address, err := ensureVip(vipName, clusterNetwork, clusterGroup, clusterName)
+				if err != nil {
+					fmt.Println("Error making vip", err)
+					continue
+				}
+
+				service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{v1.LoadBalancerIngress{IP: local_address}}
+				_, err = kubeClient.CoreV1().Services(service.Namespace).UpdateStatus(&service)
+				if err != nil {
+					fmt.Println(err)
+					continue
+				}
+
+				for _, port := range service.Spec.Ports {
+
+					// name is namespace%name%hostip%hostport%proto
+					lbName := service.Namespace + "%" + service.Name + "%" + local_address + "%" + strconv.Itoa(int(port.Port)) + "%" + strings.ToLower(string(port.Protocol))
+					manager.Create(lbName, config.Server{
+						Protocol: strings.ToLower(string(port.Protocol)),
+						Bind:     local_address + ":" + strconv.Itoa(int(port.Port)),
+						Discovery: &config.DiscoveryConfig{
+							Kind:                  "static",
+							StaticDiscoveryConfig: &config.StaticDiscoveryConfig{StaticList: []string{}},
+							// StaticDiscoveryConfig: &config.StaticDiscoveryConfig{StaticList: []string{"127.0.0.1:8990"}},
+						},
+						Healthcheck: &config.HealthcheckConfig{Kind: "ping",
+							Interval: "2s",
+							Timeout:  "500ms",
+						},
+					})
+					var backends []core.Backend
+					for _, address := range node_addresses {
+						backends = append(backends, core.Backend{Target: core.Target{Host: address, Port: strconv.Itoa(int(port.NodePort))}})
+					}
+					manager.Modify(lbName, &backends)
+				}
+
+			}
+		}
+
+		// get list of manager objects and delete any not needed
+		names, err := listVipNames(clusterGroup, clusterName)
+		if err != nil {
+			fmt.Println("Couldn't get list of vips", err)
+		} else {
+			for _, name := range names {
+				if !set.Has(name) {
+					manager.Delete(name)
+					deleteVip(name, clusterName)
+				}
+			}
+		}
+
+		<-delay.C
 	}
 
-	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
-	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
-
-	controller := NewController(kubeClient, exampleClient,
-		kubeInformerFactory.Apps().V1().Deployments(),
-		exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
-
-	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
-	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
-	kubeInformerFactory.Start(stopCh)
-	exampleInformerFactory.Start(stopCh)
-
-	if err = controller.Run(2, stopCh); err != nil {
-		klog.Fatalf("Error running controller: %s", err.Error())
-	}
 }
 
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&clusterGroup, "group", "", "The group to create the cluster in")
+	flag.StringVar(&clusterNetwork, "network", "", "The network to create the VIPs on")
+	flag.StringVar(&clusterName, "cluster", "localhost", "The cluster name to use, default value is localhost")
 }
