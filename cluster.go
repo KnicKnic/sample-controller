@@ -64,6 +64,7 @@ $r.description = "Load Balancer"
 $r |set-clusterparameter  -cluster $cluster  -Multiple @{"Network"=$clusterNetwork;"EnableDhcp"=1} -ErrorAction SilentlyContinue
 
 $r = $r | start-clusterresource -wait 30 -cluster $cluster
+$r = $r | stop-clusterresource -wait 30 -cluster $cluster
 
 
 ($r | get-clusterparameter -cluster $cluster -name "Address").Value

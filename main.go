@@ -19,13 +19,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/scylladb/go-set/strset"
 	"github.com/yyyar/gobetween/config"
-	"github.com/yyyar/gobetween/core"
 	"github.com/yyyar/gobetween/launch"
 	"github.com/yyyar/gobetween/manager"
 	v1 "k8s.io/api/core/v1"
@@ -92,36 +89,6 @@ func main() {
 	for {
 		set := strset.New()
 
-		nodes, err := kubeClient.CoreV1().Nodes().List(metav1.ListOptions{})
-		if err != nil {
-			panic(err.Error())
-		}
-		//fmt.Printf("There are %d nodes in the cluster %v\n", len(nodes.Items), nodes)
-
-		var node_addresses []string
-		for _, node := range nodes.Items {
-			ready := false
-
-			for _, condition := range node.Status.Conditions {
-				if condition.Type == v1.NodeReady {
-					ready = (condition.Status == "True")
-					break
-				}
-			}
-			if ready {
-				for _, address := range node.Status.Addresses {
-					if address.Type == v1.NodeInternalIP {
-						node_addresses = append(node_addresses, address.Address)
-					}
-				}
-			}
-		}
-
-		// for _, address := range node_addresses {
-		// 	fmt.Println(address)
-		// }
-		// fmt.Println("")
-
 		services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(metav1.ListOptions{TypeMeta: metav1.TypeMeta{Kind: "Service"}})
 		for _, service := range services.Items {
 			if service.Spec.Type == v1.ServiceTypeLoadBalancer {
@@ -129,43 +96,28 @@ func main() {
 
 				vipName := service.Namespace + "%" + service.Name
 				set.Add(vipName)
+
+				if service.Spec.LoadBalancerIP != "" {
+					continue
+				}
+
 				local_address, err := ensureVip(vipName, clusterNetwork, clusterGroup, clusterName)
 				if err != nil {
 					fmt.Println("Error making vip", err)
 					continue
 				}
+				if local_address == "" || local_address == "0.0.0.0" {
 
-				service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{v1.LoadBalancerIngress{IP: local_address}}
-				_, err = kubeClient.CoreV1().Services(service.Namespace).UpdateStatus(&service)
+					fmt.Printf("Error invalid local_address %#v\n", local_address)
+					continue
+				}
+
+				service.Spec.LoadBalancerIP = local_address
+				_, err = kubeClient.CoreV1().Services(service.Namespace).Update(&service)
 				if err != nil {
 					fmt.Println(err)
 					continue
 				}
-
-				for _, port := range service.Spec.Ports {
-
-					// name is namespace%name%hostip%hostport%proto
-					lbName := service.Namespace + "%" + service.Name + "%" + local_address + "%" + strconv.Itoa(int(port.Port)) + "%" + strings.ToLower(string(port.Protocol))
-					manager.Create(lbName, config.Server{
-						Protocol: strings.ToLower(string(port.Protocol)),
-						Bind:     local_address + ":" + strconv.Itoa(int(port.Port)),
-						Discovery: &config.DiscoveryConfig{
-							Kind:                  "static",
-							StaticDiscoveryConfig: &config.StaticDiscoveryConfig{StaticList: []string{}},
-							// StaticDiscoveryConfig: &config.StaticDiscoveryConfig{StaticList: []string{"127.0.0.1:8990"}},
-						},
-						Healthcheck: &config.HealthcheckConfig{Kind: "ping",
-							Interval: "2s",
-							Timeout:  "500ms",
-						},
-					})
-					var backends []core.Backend
-					for _, address := range node_addresses {
-						backends = append(backends, core.Backend{Target: core.Target{Host: address, Port: strconv.Itoa(int(port.NodePort))}})
-					}
-					manager.Modify(lbName, &backends)
-				}
-
 			}
 		}
 
