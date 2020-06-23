@@ -89,6 +89,10 @@ func main() {
 	for {
 		set := strset.New()
 
+		vips := strset.New()
+		vip_Names, err := listVipNames(clusterGroup, clusterName)
+		vips.Add(vip_Names...)
+
 		services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(metav1.ListOptions{TypeMeta: metav1.TypeMeta{Kind: "Service"}})
 		for _, service := range services.Items {
 			if service.Spec.Type == v1.ServiceTypeLoadBalancer {
@@ -98,7 +102,9 @@ func main() {
 				set.Add(vipName)
 
 				if service.Spec.LoadBalancerIP != "" {
-					continue
+					if vips.Has(vipName) {
+						continue
+					}
 				}
 
 				local_address, err := ensureVip(vipName, clusterNetwork, clusterGroup, clusterName)
